@@ -1,0 +1,16 @@
+.env
+.cloud.env
+.postgres-install-secret
+.server.pid
+.server-output.log
+.server-error.log
+.public-server-output.log
+.public-server-error.log
+.public-server-output.log
+.public-server-error.log
+.venv/
+.tmp/
+__pycache__/
+.logs/
+.tools/
+*.pyc

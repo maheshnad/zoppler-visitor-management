@@ -1,0 +1,5 @@
+Flask>=3.1,<4
+psycopg[binary,pool]>=3.2,<4
+waitress>=3,<4
+Pillow>=11,<13
+gunicorn>=23,<24; platform_system != "Windows"
