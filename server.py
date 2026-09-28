@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from flask import Flask, request, jsonify, session, send_from_directory, Response
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.exceptions import HTTPException
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from PIL import Image, UnidentifiedImageError
@@ -19,7 +20,17 @@ app.secret_key=os.environ.get('SECRET_KEY','')
 if len(app.secret_key)<32: raise RuntimeError('Set SECRET_KEY to a random value of at least 32 characters')
 app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE','1')=='1',MAX_CONTENT_LENGTH=6*1024*1024)
 if not os.environ.get('DATABASE_URL'): raise RuntimeError('Set DATABASE_URL')
-pool=ConnectionPool(os.environ['DATABASE_URL'],min_size=1,max_size=5,kwargs={'row_factory':dict_row},open=True)
+pool=ConnectionPool(
+    os.environ['DATABASE_URL'],
+    min_size=1,
+    max_size=5,
+    max_idle=300,
+    max_lifetime=1800,
+    reconnect_timeout=30,
+    check=ConnectionPool.check_connection,
+    kwargs={'row_factory':dict_row},
+    open=True,
+)
 email_executor=ThreadPoolExecutor(max_workers=2,thread_name_prefix='visitor-email')
 SCHEMA='''CREATE TABLE IF NOT EXISTS admins (id BIGSERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS visits (id TEXT PRIMARY KEY, name TEXT NOT NULL, mobile TEXT NOT NULL, email TEXT NOT NULL, company TEXT NOT NULL DEFAULT '', host TEXT NOT NULL, department TEXT NOT NULL DEFAULT '', visit_date DATE NOT NULL, visit_time TIME NOT NULL, purpose TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending','Approved','Rejected','Checked In','Checked Out')), created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), approved_by BIGINT REFERENCES admins(id), checked_in_at TIMESTAMPTZ, checked_out_at TIMESTAMPTZ);
@@ -55,6 +66,12 @@ def error(message,code=400): return jsonify(error=message),code
 
 @app.errorhandler(413)
 def upload_too_large(_): return error('The uploaded request is too large. Use a photo of 5 MB or smaller.',413)
+
+@app.errorhandler(Exception)
+def unexpected_error(exception):
+    if isinstance(exception,HTTPException): return exception
+    app.logger.exception('Unhandled request error')
+    return error('The server could not complete the request. Please try again.',500)
 
 def valid_photo(data,mimetype):
     expected={'image/jpeg':'JPEG','image/png':'PNG','image/webp':'WEBP'}.get(mimetype)
