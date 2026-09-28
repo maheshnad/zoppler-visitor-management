@@ -178,7 +178,7 @@ def headers(r):
 def index(): return send_from_directory(ROOT,'index.html')
 @app.get('/<path:name>')
 def assets(name):
-    if name not in ('style.css','app.js','config.js'): return error('Not found',404)
+    if name not in ('style.css','app.js','config.js','zopplerlabs_logo.jpg'): return error('Not found',404)
     return send_from_directory(ROOT,name)
 @app.get('/api/session')
 def session_info():
