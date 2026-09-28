@@ -50,7 +50,7 @@ Visitor Aadhaar numbers and photos are sensitive personal data. Photos are restr
 
 ## QR poster
 
-After HTTPS deployment, generate a QR code pointing to the site's public URL. The existing poster QR will need replacement. Do not use `localhost` in a QR intended for visitor phones.
+The permanent visitor URL is `https://zoppler-visitor-management.onrender.com/`. The file `visitor-access-qr-render.png` points to this cloud address and works independently of the office laptop and Wi-Fi.
 
 ## Stable ngrok address
 
@@ -58,4 +58,4 @@ The free ngrok account reserves `https://laboring-grumpily-trembling.ngrok-free.
 
 ## Free cloud deployment
 
-The repository includes a `Procfile` and Python version declaration for a Koyeb web-service deployment. A cloud deployment also requires a durable external PostgreSQL database such as Neon; never upload `.env` or local database credentials. Configure `DATABASE_URL`, `SECRET_KEY`, `COOKIE_SECURE=1`, and the SMTP settings as encrypted environment variables in the hosting dashboard. Free services can sleep when idle and are not intended for production availability guarantees.
+The app is deployed as a free Render web service backed by Neon PostgreSQL. The repository includes `render.yaml`, a `Procfile`, and a Python version declaration. Never upload `.env` or local database credentials. `DATABASE_URL`, `SECRET_KEY`, `COOKIE_SECURE=1`, and email settings belong only in encrypted Render environment variables. Free services can sleep when idle and may take about a minute to wake.
