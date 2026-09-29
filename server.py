@@ -1,10 +1,11 @@
-import os, re, secrets, csv, io, hashlib, smtplib, threading, time
+import os, re, secrets, csv, io, json, hashlib, smtplib, threading, time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone, timedelta
 from email.message import EmailMessage
 from functools import wraps
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 from flask import Flask, request, jsonify, session, send_from_directory, Response
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -121,7 +122,25 @@ RESET_EMAILS={
     'maheshn@zopplersystems.com'
 }
 
+def email_delivery_configured():
+    return bool(os.environ.get('RESEND_API_KEY','').strip()) or all(os.environ.get(k,'').strip() for k in ('SMTP_HOST','SMTP_FROM','SMTP_USERNAME','SMTP_PASSWORD'))
+
 def send_messages(deliveries):
+    resend_key=os.environ.get('RESEND_API_KEY','').strip()
+    if resend_key:
+        sender=os.environ.get('SMTP_FROM','').strip() or os.environ.get('EMAIL_FROM','').strip()
+        if not sender: raise RuntimeError('Set SMTP_FROM or EMAIL_FROM for email delivery')
+        failures=[]
+        for recipient,subject,body in deliveries:
+            payload=json.dumps({'from':sender,'to':[recipient],'subject':subject,'text':body}).encode('utf-8')
+            request_message=Request('https://api.resend.com/emails',data=payload,method='POST',headers={'Authorization':'Bearer '+resend_key,'Content-Type':'application/json'})
+            try:
+                with urlopen(request_message,timeout=15) as response:
+                    if response.status not in (200,201,202): raise RuntimeError('Email API returned an unexpected response')
+            except Exception:
+                app.logger.exception('Email API delivery failed for %s',recipient);failures.append(recipient)
+        if failures: raise RuntimeError('Email delivery failed for '+', '.join(failures))
+        return
     host=os.environ.get('SMTP_HOST','').strip()
     if not host: raise RuntimeError('Email delivery is not configured')
     port=int(os.environ.get('SMTP_PORT','587'))
@@ -222,7 +241,7 @@ def session_info():
         authenticated=bool(admin and admin['session_version']==session.get('session_version'))
         if not authenticated: session.clear()
     if 'csrf' not in session: session['csrf']=secrets.token_urlsafe(32)
-    return jsonify(authenticated=authenticated,csrf=session['csrf'],emailConfigured=all(os.environ.get(k) for k in ('SMTP_HOST','SMTP_FROM','SMTP_USERNAME','SMTP_PASSWORD')))
+    return jsonify(authenticated=authenticated,csrf=session['csrf'],emailConfigured=email_delivery_configured())
 @app.get('/api/health')
 def health():
     try:
@@ -258,7 +277,7 @@ def change_password():
     session.clear();return jsonify(ok=True)
 @app.post('/api/password-reset/request')
 def request_password_reset():
-    if not all(os.environ.get(k,'').strip() for k in ('SMTP_HOST','SMTP_FROM','SMTP_USERNAME','SMTP_PASSWORD')): return error('Password reset email is not configured. Contact the system administrator.',503)
+    if not email_delivery_configured(): return error('Password reset email is not configured. Contact the system administrator.',503)
     email=str((request.get_json(silent=True) or {}).get('email','')).strip().lower()
     if reset_rate_limited(email): return error('Too many reset requests. Please try again later.',429)
     reset_job=None
