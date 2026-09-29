@@ -10,6 +10,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.exceptions import HTTPException
 from psycopg_pool import ConnectionPool
+from psycopg import InterfaceError, OperationalError
+from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from PIL import Image, UnidentifiedImageError
 
@@ -45,6 +47,8 @@ ALTER TABLE visits ADD COLUMN IF NOT EXISTS photo BYTEA;
 ALTER TABLE visits ADD COLUMN IF NOT EXISTS photo_mime TEXT;
 ALTER TABLE visits ADD COLUMN IF NOT EXISTS expected_checkout_date DATE;
 ALTER TABLE visits ADD COLUMN IF NOT EXISTS expected_checkout_time TIME;
+ALTER TABLE visits ADD COLUMN IF NOT EXISTS request_token TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS visits_request_token_idx ON visits(request_token) WHERE request_token IS NOT NULL;
 CREATE TABLE IF NOT EXISTS password_resets (id BIGSERIAL PRIMARY KEY, admin_id BIGINT NOT NULL REFERENCES admins(id) ON DELETE CASCADE, token_hash TEXT UNIQUE NOT NULL, expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS otp_hash TEXT;
 ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;'''
@@ -63,6 +67,17 @@ def full(v):
     return d
 
 def error(message,code=400): return jsonify(error=message),code
+
+def retry_database(operation):
+    for attempt in range(2):
+        try:
+            return operation()
+        except (OperationalError,InterfaceError):
+            if attempt:
+                raise
+            app.logger.warning('Database connection was interrupted; retrying once')
+            try: pool.check()
+            except Exception: pass
 
 @app.errorhandler(413)
 def upload_too_large(_): return error('The uploaded request is too large. Use a photo of 5 MB or smaller.',413)
@@ -218,7 +233,9 @@ def health():
 def login():
     data=request.get_json(silent=True) or {}
     identity=str(data.get('username','')).strip()
-    with pool.connection() as conn: admin=conn.execute('SELECT id,password_hash,session_version FROM admins WHERE lower(username)=lower(%s) OR lower(email)=lower(%s)',(identity,identity)).fetchone()
+    def find_admin():
+        with pool.connection() as conn: return conn.execute('SELECT id,password_hash,session_version FROM admins WHERE lower(username)=lower(%s) OR lower(email)=lower(%s)',(identity,identity)).fetchone()
+    admin=retry_database(find_admin)
     if not admin or not check_password_hash(admin['password_hash'],str(data.get('password',''))): return error('Invalid username or password',401)
     session.clear();session['admin_id']=admin['id'];session['session_version']=admin['session_version'];session['csrf']=secrets.token_urlsafe(32)
     return jsonify(ok=True,csrf=session['csrf'])
@@ -299,9 +316,21 @@ def create():
     except ValueError: return error('Invalid date or time')
     if day<date.today(): return error('Visit date cannot be in the past')
     if datetime.combine(checkout_day,checkout_tm)<=datetime.combine(day,tm): return error('Expected checkout must be after expected arrival')
+    request_token=str(data.get('requestToken','')).strip()
+    if request_token and not re.fullmatch(r'[A-Za-z0-9_-]{20,100}',request_token): return error('Invalid request token')
+    if request_token:
+        with pool.connection() as conn:
+            existing=conn.execute('SELECT * FROM visits WHERE request_token=%s',(request_token,)).fetchone()
+        if existing: return jsonify(public(existing))
     vid='ZS-VIS-'+secrets.token_hex(8).upper()
-    with pool.connection() as conn:
-        v=conn.execute('INSERT INTO visits (id,name,mobile,email,company,host,department,visit_date,visit_time,expected_checkout_date,expected_checkout_time,purpose,aadhar_number,photo,photo_mime) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',(vid,x['name'],x['mobile'],x['email'],x['company'],x['host'],x['department'],day,tm,checkout_day,checkout_tm,x['purpose'],x['aadhar'],photo_data,photo.mimetype)).fetchone()
+    def insert_visit():
+        with pool.connection() as conn:
+            return conn.execute('INSERT INTO visits (id,name,mobile,email,company,host,department,visit_date,visit_time,expected_checkout_date,expected_checkout_time,purpose,aadhar_number,photo,photo_mime,request_token) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',(vid,x['name'],x['mobile'],x['email'],x['company'],x['host'],x['department'],day,tm,checkout_day,checkout_tm,x['purpose'],x['aadhar'],photo_data,photo.mimetype,request_token or None)).fetchone()
+    try: v=retry_database(insert_visit)
+    except UniqueViolation:
+        with pool.connection() as conn: v=conn.execute('SELECT * FROM visits WHERE request_token=%s',(request_token,)).fetchone()
+        if not v: raise
+        return jsonify(public(v))
     queue_email(send_approval_email,email_visit(v),request.host_url)
     return jsonify(public(v)),201
 @app.get('/api/visits/<vid>/status')
