@@ -24,8 +24,8 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SES
 if not os.environ.get('DATABASE_URL'): raise RuntimeError('Set DATABASE_URL')
 pool=ConnectionPool(
     os.environ['DATABASE_URL'],
-    min_size=1,
-    max_size=5,
+    min_size=0,
+    max_size=2,
     max_idle=300,
     max_lifetime=1800,
     reconnect_timeout=30,
