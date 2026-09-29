@@ -216,7 +216,9 @@ def assets(name):
 def session_info():
     authenticated=False
     if session.get('admin_id'):
-        with pool.connection() as conn: admin=conn.execute('SELECT session_version FROM admins WHERE id=%s',(session['admin_id'],)).fetchone()
+        def current_admin():
+            with pool.connection() as conn: return conn.execute('SELECT session_version FROM admins WHERE id=%s',(session['admin_id'],)).fetchone()
+        admin=retry_database(current_admin)
         authenticated=bool(admin and admin['session_version']==session.get('session_version'))
         if not authenticated: session.clear()
     if 'csrf' not in session: session['csrf']=secrets.token_urlsafe(32)
@@ -261,13 +263,15 @@ def request_password_reset():
     if reset_rate_limited(email): return error('Too many reset requests. Please try again later.',429)
     reset_job=None
     if email in RESET_EMAILS:
-        with pool.connection() as conn:
-            admin=conn.execute('SELECT id FROM admins WHERE lower(email)=%s',(email,)).fetchone()
-            if admin:
+        def create_reset():
+            with pool.connection() as conn:
+                admin=conn.execute('SELECT id FROM admins WHERE lower(email)=%s',(email,)).fetchone()
+                if not admin: return None
                 token=secrets.token_urlsafe(40);token_hash=hashlib.sha256(token.encode()).hexdigest();otp=f'{secrets.randbelow(1000000):06d}';otp_hash=hashlib.sha256(otp.encode()).hexdigest()
                 conn.execute('DELETE FROM password_resets WHERE admin_id=%s OR expires_at<now()',(admin['id'],))
                 conn.execute('INSERT INTO password_resets(admin_id,token_hash,otp_hash,expires_at) VALUES (%s,%s,%s,%s)',(admin['id'],token_hash,otp_hash,datetime.now(timezone.utc)+timedelta(minutes=30)))
-                reset_job=(email,token,otp,token_hash,request.host_url)
+                return (email,token,otp,token_hash,request.host_url)
+        reset_job=retry_database(create_reset)
     if reset_job: queue_email(send_reset_email_job,*reset_job)
     return jsonify(message='If this address is authorized, a reset link has been sent.')
 @app.post('/api/password-reset/confirm')
@@ -319,8 +323,9 @@ def create():
     request_token=str(data.get('requestToken','')).strip()
     if request_token and not re.fullmatch(r'[A-Za-z0-9_-]{20,100}',request_token): return error('Invalid request token')
     if request_token:
-        with pool.connection() as conn:
-            existing=conn.execute('SELECT * FROM visits WHERE request_token=%s',(request_token,)).fetchone()
+        def find_existing():
+            with pool.connection() as conn: return conn.execute('SELECT * FROM visits WHERE request_token=%s',(request_token,)).fetchone()
+        existing=retry_database(find_existing)
         if existing: return jsonify(public(existing))
     vid='ZS-VIS-'+secrets.token_hex(8).upper()
     def insert_visit():
@@ -328,7 +333,7 @@ def create():
             return conn.execute('INSERT INTO visits (id,name,mobile,email,company,host,department,visit_date,visit_time,expected_checkout_date,expected_checkout_time,purpose,aadhar_number,photo,photo_mime,request_token) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',(vid,x['name'],x['mobile'],x['email'],x['company'],x['host'],x['department'],day,tm,checkout_day,checkout_tm,x['purpose'],x['aadhar'],photo_data,photo.mimetype,request_token or None)).fetchone()
     try: v=retry_database(insert_visit)
     except UniqueViolation:
-        with pool.connection() as conn: v=conn.execute('SELECT * FROM visits WHERE request_token=%s',(request_token,)).fetchone()
+        v=retry_database(find_existing)
         if not v: raise
         return jsonify(public(v))
     queue_email(send_approval_email,email_visit(v),request.host_url)
