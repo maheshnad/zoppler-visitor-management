@@ -16,4 +16,17 @@ jobs:
     timeout-minutes: 2
     steps:
       - name: Ping public health endpoint
-        run: curl --fail --silent --show-error --max-time 60 https://zoppler-visitor-management.onrender.com/api/health
+        # A free Render service can be starting when this workflow runs.
+        # Retry long enough for it to wake, but do not fail the workflow or
+        # generate GitHub failure-notification emails if Render is unavailable.
+        run: |
+          for attempt in 1 2 3; do
+            if curl --fail --silent --show-error --max-time 50 https://zoppler-visitor-management.onrender.com/api/health; then
+              echo "Visitor service is awake."
+              exit 0
+            fi
+            echo "Health check attempt $attempt did not complete; retrying shortly."
+            sleep 15
+          done
+          echo "Render was unavailable for this check. Ending successfully to avoid notification emails."
+          exit 0
