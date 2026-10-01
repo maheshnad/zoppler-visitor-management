@@ -10,7 +10,6 @@ from flask import Flask, request, jsonify, session, send_from_directory, Respons
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.exceptions import HTTPException
-from psycopg_pool import ConnectionPool
 from psycopg import InterfaceError, OperationalError, connect
 from psycopg.rows import dict_row
 from PIL import Image, UnidentifiedImageError
@@ -22,17 +21,9 @@ app.secret_key=os.environ.get('SECRET_KEY','')
 if len(app.secret_key)<32: raise RuntimeError('Set SECRET_KEY to a random value of at least 32 characters')
 app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE','1')=='1',MAX_CONTENT_LENGTH=6*1024*1024)
 if not os.environ.get('DATABASE_URL'): raise RuntimeError('Set DATABASE_URL')
-pool=ConnectionPool(
-    os.environ['DATABASE_URL'],
-    min_size=0,
-    max_size=2,
-    max_idle=300,
-    max_lifetime=1800,
-    reconnect_timeout=30,
-    check=ConnectionPool.check_connection,
-    kwargs={'row_factory':dict_row},
-    open=True,
-)
+def db_connection():
+    return connect(os.environ['DATABASE_URL'],row_factory=dict_row,connect_timeout=15)
+
 email_executor=ThreadPoolExecutor(max_workers=2,thread_name_prefix='visitor-email')
 photo_executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='visitor-photo')
 SCHEMA='''CREATE TABLE IF NOT EXISTS admins (id BIGSERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -53,7 +44,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS visits_request_token_idx ON visits(request_tok
 CREATE TABLE IF NOT EXISTS password_resets (id BIGSERIAL PRIMARY KEY, admin_id BIGINT NOT NULL REFERENCES admins(id) ON DELETE CASCADE, token_hash TEXT UNIQUE NOT NULL, expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS otp_hash TEXT;
 ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;'''
-with pool.connection() as conn:
+with db_connection() as conn:
     for statement in SCHEMA.split(';'):
         if statement.strip(): conn.execute(statement)
 
@@ -77,8 +68,7 @@ def retry_database(operation):
             if attempt:
                 raise
             app.logger.warning('Database connection was interrupted; retrying once')
-            try: pool.check()
-            except Exception: pass
+            time.sleep(.25)
 
 @app.errorhandler(413)
 def upload_too_large(_): return error('The uploaded request is too large. Use a photo of 5 MB or smaller.',413)
@@ -176,7 +166,7 @@ def save_visit_photo(visit_id,photo_data,photo_mime):
     for attempt in range(3):
         try:
             def store():
-                with pool.connection() as conn:
+                with db_connection() as conn:
                     conn.execute('UPDATE visits SET photo=%s,photo_mime=%s WHERE id=%s AND photo IS NULL',(photo_data,photo_mime,visit_id))
             retry_database(store)
             return
@@ -198,7 +188,7 @@ def send_reset_email(recipient,token,otp,base_url):
 def send_reset_email_job(recipient,token,otp,token_hash,base_url):
     try: send_reset_email(recipient,token,otp,base_url)
     except Exception:
-        with pool.connection() as conn: conn.execute('DELETE FROM password_resets WHERE token_hash=%s',(token_hash,))
+        with db_connection() as conn: conn.execute('DELETE FROM password_resets WHERE token_hash=%s',(token_hash,))
         raise
 
 def send_approval_email(v,base_url):
@@ -223,7 +213,7 @@ def admin_required(fn):
     @wraps(fn)
     def inner(*args,**kwargs):
         if not session.get('admin_id'): return error('Please sign in',401)
-        with pool.connection() as conn: admin=conn.execute('SELECT session_version FROM admins WHERE id=%s',(session['admin_id'],)).fetchone()
+        with db_connection() as conn: admin=conn.execute('SELECT session_version FROM admins WHERE id=%s',(session['admin_id'],)).fetchone()
         if not admin or admin['session_version']!=session.get('session_version'):
             session.clear();return error('Your session has expired. Please sign in again.',401)
         return fn(*args,**kwargs)
@@ -255,7 +245,7 @@ def session_info():
     authenticated=False
     if session.get('admin_id'):
         def current_admin():
-            with pool.connection() as conn: return conn.execute('SELECT session_version FROM admins WHERE id=%s',(session['admin_id'],)).fetchone()
+            with db_connection() as conn: return conn.execute('SELECT session_version FROM admins WHERE id=%s',(session['admin_id'],)).fetchone()
         admin=retry_database(current_admin)
         authenticated=bool(admin and admin['session_version']==session.get('session_version'))
         if not authenticated: session.clear()
@@ -264,7 +254,7 @@ def session_info():
 @app.get('/api/health')
 def health():
     try:
-        with pool.connection() as conn: conn.execute('SELECT 1').fetchone()
+        with db_connection() as conn: conn.execute('SELECT 1').fetchone()
         return jsonify(ok=True)
     except Exception:
         app.logger.exception('Health check failed')
@@ -274,7 +264,7 @@ def login():
     data=request.get_json(silent=True) or {}
     identity=str(data.get('username','')).strip()
     def find_admin():
-        with pool.connection() as conn: return conn.execute('SELECT id,password_hash,session_version FROM admins WHERE lower(username)=lower(%s) OR lower(email)=lower(%s)',(identity,identity)).fetchone()
+        with db_connection() as conn: return conn.execute('SELECT id,password_hash,session_version FROM admins WHERE lower(username)=lower(%s) OR lower(email)=lower(%s)',(identity,identity)).fetchone()
     admin=retry_database(find_admin)
     if not admin or not check_password_hash(admin['password_hash'],str(data.get('password',''))): return error('Invalid username or password',401)
     session.clear();session['admin_id']=admin['id'];session['session_version']=admin['session_version'];session['csrf']=secrets.token_urlsafe(32)
@@ -288,7 +278,7 @@ def change_password():
     current=str(data.get('currentPassword',''));new=str(data.get('newPassword',''))
     if len(new)<12: return error('New password must be at least 12 characters')
     if current==new: return error('New password must be different from the current password')
-    with pool.connection() as conn:
+    with db_connection() as conn:
         admin=conn.execute('SELECT username,email,password_hash FROM admins WHERE id=%s',(session['admin_id'],)).fetchone()
         if not admin or not check_password_hash(admin['password_hash'],current): return error('Current password is incorrect',401)
         if new.casefold() in (admin['username'].casefold(),(admin['email'] or '').casefold()): return error('New password must be different from your login ID and email address')
@@ -302,7 +292,7 @@ def request_password_reset():
     reset_job=None
     if email in RESET_EMAILS:
         def create_reset():
-            with pool.connection() as conn:
+            with db_connection() as conn:
                 admin=conn.execute('SELECT id FROM admins WHERE lower(email)=%s',(email,)).fetchone()
                 if not admin: return None
                 token=secrets.token_urlsafe(40);token_hash=hashlib.sha256(token.encode()).hexdigest();otp=f'{secrets.randbelow(1000000):06d}';otp_hash=hashlib.sha256(otp.encode()).hexdigest()
@@ -318,7 +308,7 @@ def confirm_password_reset():
     if not re.fullmatch(r'[A-Za-z0-9._-]{3,64}',username): return error('Login ID must be 3-64 characters and use only letters, numbers, dots, underscores, or hyphens')
     if len(password)<12: return error('Password must be at least 12 characters')
     if password.casefold()==username.casefold(): return error('Password must be different from the login ID')
-    with pool.connection() as conn:
+    with db_connection() as conn:
         if token:
             token_hash=hashlib.sha256(token.encode()).hexdigest()
             reset=conn.execute('SELECT id,admin_id FROM password_resets WHERE token_hash=%s AND used_at IS NULL AND expires_at>now() FOR UPDATE',(token_hash,)).fetchone()
@@ -373,25 +363,25 @@ def create():
     return (jsonify(public(v)),201) if inserted else jsonify(public(v))
 @app.get('/api/visits/<vid>/status')
 def status(vid):
-    with pool.connection() as conn: v=conn.execute('SELECT * FROM visits WHERE id=%s',(vid.strip().upper(),)).fetchone()
+    with db_connection() as conn: v=conn.execute('SELECT * FROM visits WHERE id=%s',(vid.strip().upper(),)).fetchone()
     return jsonify(public(v)) if v else error('Request not found',404)
 @app.get('/api/visits/<vid>/photo')
 @admin_required
 def visitor_photo(vid):
-    with pool.connection() as conn: v=conn.execute('SELECT photo,photo_mime FROM visits WHERE id=%s',(vid,)).fetchone()
+    with db_connection() as conn: v=conn.execute('SELECT photo,photo_mime FROM visits WHERE id=%s',(vid,)).fetchone()
     if not v or not v['photo']: return error('Photo not found',404)
     return Response(bytes(v['photo']),mimetype=v['photo_mime'],headers={'Content-Disposition':'inline'})
 @app.get('/api/visits')
 @admin_required
 def list_visits():
-    with pool.connection() as conn: rows=conn.execute('SELECT * FROM visits ORDER BY created_at DESC LIMIT 1000').fetchall()
+    with db_connection() as conn: rows=conn.execute('SELECT * FROM visits ORDER BY created_at DESC LIMIT 1000').fetchall()
     return jsonify([full(v) for v in rows])
 @app.patch('/api/visits/<vid>/status')
 @admin_required
 def update(vid):
     target=str((request.get_json(silent=True) or {}).get('status',''))
     allowed={'Pending':('Approved','Rejected'),'Approved':('Checked In',),'Checked In':('Checked Out',)}
-    with pool.connection() as conn:
+    with db_connection() as conn:
         v=conn.execute('SELECT * FROM visits WHERE id=%s FOR UPDATE',(vid,)).fetchone()
         if not v: return error('Request not found',404)
         if target not in allowed.get(v['status'],()): return error('Invalid status transition',409)
@@ -404,6 +394,6 @@ def create_admin():
     import getpass
     username=input('Admin username: ').strip();password=getpass.getpass('Admin password (12+ characters): ')
     if not username or len(password)<12: raise SystemExit('Username required; password must be at least 12 characters')
-    with pool.connection() as conn: conn.execute('INSERT INTO admins(username,password_hash) VALUES (%s,%s) ON CONFLICT(username) DO UPDATE SET password_hash=excluded.password_hash',(username,generate_password_hash(password)))
+    with db_connection() as conn: conn.execute('INSERT INTO admins(username,password_hash) VALUES (%s,%s) ON CONFLICT(username) DO UPDATE SET password_hash=excluded.password_hash',(username,generate_password_hash(password)))
     print('Admin account saved')
 if __name__=='__main__': app.run(host='127.0.0.1',port=5000,debug=False)
