@@ -113,7 +113,12 @@ RESET_EMAILS={
 }
 
 def email_delivery_configured():
-    return bool(os.environ.get('RESEND_API_KEY','').strip()) or all(os.environ.get(k,'').strip() for k in ('SMTP_HOST','SMTP_FROM','SMTP_USERNAME','SMTP_PASSWORD'))
+    resend_ready=bool(os.environ.get('RESEND_API_KEY','').strip()) and bool((os.environ.get('SMTP_FROM','') or os.environ.get('EMAIL_FROM','')).strip())
+    # Render Free blocks outbound SMTP ports. Only an HTTPS email provider can
+    # truthfully be reported as configured in that environment.
+    if os.environ.get('RENDER') or os.environ.get('RENDER_EXTERNAL_HOSTNAME'):
+        return resend_ready
+    return resend_ready or all(os.environ.get(k,'').strip() for k in ('SMTP_HOST','SMTP_FROM','SMTP_USERNAME','SMTP_PASSWORD'))
 
 def send_messages(deliveries):
     resend_key=os.environ.get('RESEND_API_KEY','').strip()
@@ -286,7 +291,7 @@ def change_password():
     session.clear();return jsonify(ok=True)
 @app.post('/api/password-reset/request')
 def request_password_reset():
-    if not email_delivery_configured(): return error('Password reset email is not configured. Contact the system administrator.',503)
+    if not email_delivery_configured(): return error('Password reset email is not configured for this cloud server. Add RESEND_API_KEY and a verified sender in Render.',503)
     email=str((request.get_json(silent=True) or {}).get('email','')).strip().lower()
     if reset_rate_limited(email): return error('Too many reset requests. Please try again later.',429)
     reset_job=None
@@ -300,7 +305,11 @@ def request_password_reset():
                 conn.execute('INSERT INTO password_resets(admin_id,token_hash,otp_hash,expires_at) VALUES (%s,%s,%s,%s)',(admin['id'],token_hash,otp_hash,datetime.now(timezone.utc)+timedelta(minutes=30)))
                 return (email,token,otp,token_hash,request.host_url)
         reset_job=retry_database(create_reset)
-    if reset_job: queue_email(send_reset_email_job,*reset_job)
+    if reset_job:
+        try: send_reset_email_job(*reset_job)
+        except Exception:
+            app.logger.exception('Password reset delivery failed')
+            return error('The reset email could not be delivered. Check the cloud email configuration and try again.',503)
     return jsonify(message='If this address is authorized, a reset link has been sent.')
 @app.post('/api/password-reset/confirm')
 def confirm_password_reset():
