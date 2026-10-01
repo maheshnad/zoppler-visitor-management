@@ -35,6 +35,7 @@ pool=ConnectionPool(
     open=True,
 )
 email_executor=ThreadPoolExecutor(max_workers=2,thread_name_prefix='visitor-email')
+photo_executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='visitor-photo')
 SCHEMA='''CREATE TABLE IF NOT EXISTS admins (id BIGSERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS visits (id TEXT PRIMARY KEY, name TEXT NOT NULL, mobile TEXT NOT NULL, email TEXT NOT NULL, company TEXT NOT NULL DEFAULT '', host TEXT NOT NULL, department TEXT NOT NULL DEFAULT '', visit_date DATE NOT NULL, visit_time TIME NOT NULL, purpose TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending','Approved','Rejected','Checked In','Checked Out')), created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), approved_by BIGINT REFERENCES admins(id), checked_in_at TIMESTAMPTZ, checked_out_at TIMESTAMPTZ);
 CREATE TABLE IF NOT EXISTS visit_audit (id BIGSERIAL PRIMARY KEY, visit_id TEXT NOT NULL REFERENCES visits(id), admin_id BIGINT NOT NULL REFERENCES admins(id), old_status TEXT NOT NULL, new_status TEXT NOT NULL, changed_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -170,6 +171,25 @@ def queue_email(fn,*args):
     def finished(done):
         try: done.result()
         except Exception: app.logger.exception('Background email job failed')
+    future.add_done_callback(finished)
+
+def save_visit_photo(visit_id,photo_data,photo_mime):
+    for attempt in range(3):
+        try:
+            def store():
+                with pool.connection() as conn:
+                    conn.execute('UPDATE visits SET photo=%s,photo_mime=%s WHERE id=%s AND photo IS NULL',(photo_data,photo_mime,visit_id))
+            retry_database(store)
+            return
+        except Exception:
+            if attempt==2: raise
+            time.sleep(1.5*(attempt+1))
+
+def queue_visit_photo(visit_id,photo_data,photo_mime):
+    future=photo_executor.submit(save_visit_photo,visit_id,photo_data,photo_mime)
+    def finished(done):
+        try: done.result()
+        except Exception: app.logger.exception('Background photo storage failed for %s',visit_id)
     future.add_done_callback(finished)
 
 def send_reset_email(recipient,token,otp,base_url):
@@ -345,16 +365,20 @@ def create():
         def find_existing():
             with pool.connection() as conn: return conn.execute('SELECT * FROM visits WHERE request_token=%s',(request_token,)).fetchone()
         existing=retry_database(find_existing)
-        if existing: return jsonify(public(existing))
+        if existing:
+            if not existing.get('photo'): queue_visit_photo(existing['id'],photo_data,photo.mimetype)
+            return jsonify(public(existing))
     vid='ZS-VIS-'+secrets.token_hex(8).upper()
     def insert_visit():
         with pool.connection() as conn:
-            return conn.execute('INSERT INTO visits (id,name,mobile,email,company,host,department,visit_date,visit_time,expected_checkout_date,expected_checkout_time,purpose,aadhar_number,photo,photo_mime,request_token) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',(vid,x['name'],x['mobile'],x['email'],x['company'],x['host'],x['department'],day,tm,checkout_day,checkout_tm,x['purpose'],x['aadhar'],photo_data,photo.mimetype,request_token or None)).fetchone()
+            return conn.execute('INSERT INTO visits (id,name,mobile,email,company,host,department,visit_date,visit_time,expected_checkout_date,expected_checkout_time,purpose,aadhar_number,request_token) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',(vid,x['name'],x['mobile'],x['email'],x['company'],x['host'],x['department'],day,tm,checkout_day,checkout_tm,x['purpose'],x['aadhar'],request_token or None)).fetchone()
     try: v=retry_database(insert_visit)
     except UniqueViolation:
         v=retry_database(find_existing)
         if not v: raise
+        if not v.get('photo'): queue_visit_photo(v['id'],photo_data,photo.mimetype)
         return jsonify(public(v))
+    queue_visit_photo(v['id'],photo_data,photo.mimetype)
     queue_email(send_approval_email,email_visit(v),request.host_url)
     return jsonify(public(v)),201
 @app.get('/api/visits/<vid>/status')
