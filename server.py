@@ -11,8 +11,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.exceptions import HTTPException
 from psycopg_pool import ConnectionPool
-from psycopg import InterfaceError, OperationalError
-from psycopg.errors import UniqueViolation
+from psycopg import InterfaceError, OperationalError, connect
 from psycopg.rows import dict_row
 from PIL import Image, UnidentifiedImageError
 
@@ -361,26 +360,17 @@ def create():
     if datetime.combine(checkout_day,checkout_tm)<=datetime.combine(day,tm): return error('Expected checkout must be after expected arrival')
     request_token=str(data.get('requestToken','')).strip()
     if request_token and not re.fullmatch(r'[A-Za-z0-9_-]{20,100}',request_token): return error('Invalid request token')
-    if request_token:
-        def find_existing():
-            with pool.connection() as conn: return conn.execute('SELECT * FROM visits WHERE request_token=%s',(request_token,)).fetchone()
-        existing=retry_database(find_existing)
-        if existing:
-            if not existing.get('photo'): queue_visit_photo(existing['id'],photo_data,photo.mimetype)
-            return jsonify(public(existing))
     vid='ZS-VIS-'+secrets.token_hex(8).upper()
-    def insert_visit():
-        with pool.connection() as conn:
-            return conn.execute('INSERT INTO visits (id,name,mobile,email,company,host,department,visit_date,visit_time,expected_checkout_date,expected_checkout_time,purpose,aadhar_number,request_token) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',(vid,x['name'],x['mobile'],x['email'],x['company'],x['host'],x['department'],day,tm,checkout_day,checkout_tm,x['purpose'],x['aadhar'],request_token or None)).fetchone()
-    try: v=retry_database(insert_visit)
-    except UniqueViolation:
-        v=retry_database(find_existing)
-        if not v: raise
-        if not v.get('photo'): queue_visit_photo(v['id'],photo_data,photo.mimetype)
-        return jsonify(public(v))
+    # Public submissions use a dedicated short-lived connection. This prevents
+    # Render background health/photo work from exhausting the small shared pool.
+    with connect(os.environ['DATABASE_URL'],row_factory=dict_row,connect_timeout=15) as conn:
+        v=conn.execute('INSERT INTO visits (id,name,mobile,email,company,host,department,visit_date,visit_time,expected_checkout_date,expected_checkout_time,purpose,aadhar_number,request_token) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (request_token) WHERE request_token IS NOT NULL DO NOTHING RETURNING *',(vid,x['name'],x['mobile'],x['email'],x['company'],x['host'],x['department'],day,tm,checkout_day,checkout_tm,x['purpose'],x['aadhar'],request_token or None)).fetchone()
+        inserted=bool(v)
+        if not v: v=conn.execute('SELECT * FROM visits WHERE request_token=%s',(request_token,)).fetchone()
+    if not v: raise RuntimeError('Visitor request could not be saved')
     queue_visit_photo(v['id'],photo_data,photo.mimetype)
-    queue_email(send_approval_email,email_visit(v),request.host_url)
-    return jsonify(public(v)),201
+    if inserted: queue_email(send_approval_email,email_visit(v),request.host_url)
+    return (jsonify(public(v)),201) if inserted else jsonify(public(v))
 @app.get('/api/visits/<vid>/status')
 def status(vid):
     with pool.connection() as conn: v=conn.execute('SELECT * FROM visits WHERE id=%s',(vid.strip().upper(),)).fetchone()
