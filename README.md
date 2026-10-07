@@ -44,7 +44,7 @@ The app creates its own `admins`, `visits`, and `visit_audit` tables in the data
 
 Management password resets are limited to the five allowlisted addresses in `server.py`. Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_TLS`, `SMTP_USERNAME`, `SMTP_PASSWORD`, and `SMTP_FROM` in `.env` to enable delivery of 30-minute, one-time reset links. Until SMTP is configured, the existing management login continues to work but reset requests return a configuration message.
 
-For the free Render plan, configure `RESEND_API_KEY` and `SMTP_FROM` (or `EMAIL_FROM`) instead of SMTP credentials. This sends reset OTPs and visitor notifications over HTTPS, avoiding hosting-provider SMTP-port restrictions. Keep the API key only in Render environment variables; never commit it.
+For the free Render plan, configure `RESEND_API_KEY` and `SMTP_FROM` (or `EMAIL_FROM`) instead of SMTP credentials. This sends reset OTPs and visitor notifications over HTTPS, avoiding hosting-provider SMTP-port restrictions. The sender must use a domain verified in Resend. Keep the API key only in Render environment variables; never commit it. After saving the variables, redeploy or restart the Render service and confirm that `/api/session` reports `"emailConfigured": true`.
 
 When SMTP is configured, every new visitor request sends an approval notification to all five authorized management addresses. All five management addresses and the visitor also receive an email whenever a request is approved, rejected, checked in, or checked out. Messages exclude Aadhaar and photo data. Email delivery failure is logged and does not discard an otherwise valid visitor request or status change.
 

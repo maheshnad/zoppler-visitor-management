@@ -241,6 +241,8 @@ def headers(r):
     return r
 @app.get('/')
 def index(): return send_from_directory(ROOT,'index.html')
+@app.get('/favicon.ico')
+def favicon(): return send_from_directory(ROOT,'zopplerlabs_logo.jpg',mimetype='image/jpeg')
 @app.get('/<path:name>')
 def assets(name):
     if name not in ('style.css','app.js','config.js','zopplerlabs_logo.jpg'): return error('Not found',404)

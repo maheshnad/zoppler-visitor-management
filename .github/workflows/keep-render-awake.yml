@@ -20,13 +20,15 @@ jobs:
         # Retry long enough for it to wake, but do not fail the workflow or
         # generate GitHub failure-notification emails if Render is unavailable.
         run: |
-          for attempt in 1 2 3; do
-            if curl --fail --silent --show-error --max-time 50 https://zoppler-visitor-management.onrender.com/api/health; then
+          # Keep the loop below the two-minute job timeout. The old retries
+          # could take three minutes, so GitHub cancelled the job first.
+          for attempt in 1 2; do
+            if curl --fail --silent --show-error --connect-timeout 10 --max-time 35 https://zoppler-visitor-management.onrender.com/api/health; then
               echo "Visitor service is awake."
               exit 0
             fi
             echo "Health check attempt $attempt did not complete; retrying shortly."
-            sleep 15
+            sleep 5
           done
           echo "Render was unavailable for this check. Ending successfully to avoid notification emails."
           exit 0
